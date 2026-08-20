@@ -1,0 +1,11 @@
+{
+  "required": true,
+  "package": "com.example.parkour.mixin",
+  "compatibilityLevel": "JAVA_25",
+  "mixins": [
+    "ServerGamePacketListenerImplMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

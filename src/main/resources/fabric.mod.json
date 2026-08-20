@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "id": "parkourmod",
+  "version": "${version}",
+  "name": "Simply Parkour",
+  "description": "Simple Fabric parkour timer with checkpoints and Text Display leaderboard.",
+  "authors": [
+    "Nieyels"
+  ],
+  "contact": {
+    "sources": "https://example.com"
+  },
+  "icon": "assets/parkourmod/icon.png",
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "com.example.parkour.ParkourMod"
+    ]
+  },
+  "mixins": [
+    "parkourmod.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.19.3",
+    "minecraft": "26.2",
+    "fabric-api": "*",
+    "java": ">=25"
+  }
+}
