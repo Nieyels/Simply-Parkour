@@ -238,6 +238,7 @@ final class ParkourCommands {
 		ParkourLocation location = ParkourLocation.from(level, blockPos.getX(), blockPos.getY(), blockPos.getZ(), source.getRotation().y, source.getRotation().x);
 		storage().parkour(name).checkpoints.add(location);
 		storage().save(source.getServer());
+		runtime().updateCheckpointPlateIndex(name);
 		source.sendSuccess(() -> message("Parkour '" + name + "' checkpoint toegevoegd.", ParkourText.GREEN), false);
 		return Command.SINGLE_SUCCESS;
 	}
@@ -264,7 +265,7 @@ final class ParkourCommands {
 		source.sendSuccess(() -> editableConfigLine("Finish", formatLocation(parkour.finish), "/parkour set finish " + name, "Zet finish op de pressure plate waar je op staat"), false);
 		source.sendSuccess(() -> editableConfigLine("Scoreboard", formatLocation(parkour.scoreboard), "/parkour set scoreboard " + name, "Zet scoreboard op je huidige positie"), false);
 		source.sendSuccess(() -> clickableConfigLine("Checkpoints", String.valueOf(parkour.checkpoints.size()), "/parkour checkpoint list " + name, "Toon alle checkpoints"), false);
-		source.sendSuccess(() -> editableConfigLine("Fall distance", formatNumber(parkour.fallDistance), "/parkour config " + name + " fallDistance " + formatNumber(parkour.fallDistance), "Pas de normale valafstand aan"), false);
+		source.sendSuccess(() -> editableConfigLine("Fall distance", formatFallDistance(parkour.fallDistance), "/parkour config " + name + " fallDistance " + formatFallDistance(parkour.fallDistance), "Pas de normale valafstand aan"), false);
 		source.sendSuccess(() -> clickableConfigLine("Fall points", String.valueOf(parkour.fallZones.size()), "/parkour fall list " + name, "Toon alle diepe fall points"), false);
 		if (!parkour.checkpoints.isEmpty()) {
 			source.sendSuccess(() -> ParkourText.label("Checkpoints:", ParkourText.GOLD), false);
@@ -294,7 +295,7 @@ final class ParkourCommands {
 
 		parkour.fallDistance = blocks;
 		storage().save(source.getServer());
-		source.sendSuccess(() -> message("Parkour '" + name + "' fall distance ingesteld op " + formatNumber(blocks) + " blokken.", ParkourText.GREEN), false);
+		source.sendSuccess(() -> message("Parkour '" + name + "' fall distance ingesteld op " + formatFallDistance(blocks) + " blokken.", ParkourText.GREEN), false);
 		return Command.SINGLE_SUCCESS;
 	}
 
@@ -451,6 +452,7 @@ final class ParkourCommands {
 
 		parkour.checkpoints.remove(id - 1);
 		storage().save(source.getServer());
+		runtime().updateCheckpointPlateIndex(name);
 		source.sendSuccess(() -> message("Checkpoint #" + id + " verwijderd van parkour '" + name + "'.", ParkourText.GREEN), false);
 		return Command.SINGLE_SUCCESS;
 	}
@@ -522,6 +524,10 @@ final class ParkourCommands {
 
 	private String formatNumber(double value) {
 		return String.format(Locale.ROOT, "%.3f", value);
+	}
+
+	private String formatFallDistance(double value) {
+		return String.format(Locale.ROOT, "%.1f", value);
 	}
 
 	private ParkourStorage storage() {

@@ -5,11 +5,10 @@ import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.core.particles.ParticleTypes;
 import net.minecraft.network.chat.Component;
-import net.minecraft.network.protocol.game.ClientboundAddEntityPacket;
-import net.minecraft.network.protocol.game.ClientboundRemoveEntitiesPacket;
-import net.minecraft.network.protocol.game.ClientboundRotateHeadPacket;
 import net.minecraft.network.protocol.game.ClientboundSetEntityDataPacket;
 import net.minecraft.network.protocol.game.ClientboundSoundPacket;
+import net.minecraft.network.syncher.EntityDataAccessor;
+import net.minecraft.network.syncher.SynchedEntityData;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.ServerScoreboard;
 import net.minecraft.server.level.ServerLevel;
@@ -21,6 +20,7 @@ import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.damagesource.DamageSource;
 import net.minecraft.world.damagesource.DamageTypes;
+import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.ItemStack;
@@ -32,8 +32,10 @@ import net.minecraft.world.scores.Team;
 
 import java.util.EnumSet;
 import java.util.Comparator;
+import java.lang.reflect.Field;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -43,6 +45,7 @@ final class ParkourRuntime {
 	private static final int CHECKPOINT_SLOT = 7;
 	private static final int RESET_SLOT = 8;
 	private static final double AUTO_HIDE_PLAYER_RADIUS = 3.0D;
+	private static final double AUTO_SHOW_PLAYER_RADIUS = 3.45D;
 	private static final double FALL_ZONE_RADIUS = 1.8D;
 	private static final double SPAWN_YAW_CHECK_RADIUS = 3.0D;
 	private static final double PRESSURE_PLATE_EDGE_SAMPLE = 0.25D;
@@ -50,6 +53,9 @@ final class ParkourRuntime {
 	private static final double PRESSURE_PLATE_TOUCH_HEIGHT = 0.25D;
 	private static final long FALL_DAMAGE_GRACE_MILLIS = 1000L;
 	private static final int FINISH_TELEPORT_DELAY_TICKS = 20;
+	private static final int AUTO_HIDE_RELEASE_TICKS = 8;
+	private static final byte INVISIBLE_FLAG = 0x20;
+	private static final EntityDataAccessor<Byte> SHARED_FLAGS_ACCESSOR = sharedFlagsAccessor();
 	private static final Component RESET_ITEM_NAME = ParkourText.label("Reset", ParkourText.RED);
 	private static final Component CHECKPOINT_ITEM_NAME = ParkourText.label("Checkpoint", ParkourText.ORANGE);
 
@@ -60,9 +66,12 @@ final class ParkourRuntime {
 	private final Map<UUID, Long> fallDamageGraceUntil = new HashMap<>();
 	private final Map<UUID, PendingTeleport> finishTeleports = new HashMap<>();
 	private final Map<UUID, Set<Integer>> hiddenEntityIdsByViewer = new HashMap<>();
+	private final Map<UUID, Map<Integer, Integer>> hiddenReleaseTicksByViewer = new HashMap<>();
 	private final Map<UUID, String> previousTeams = new HashMap<>();
 	private final Map<UUID, PlayerSnapshot> playerSnapshots = new HashMap<>();
 	private final Map<PlateKey, String> startPlateIndex = new HashMap<>();
+	private final Map<String, Map<PlateKey, Integer>> checkpointPlateIndexes = new HashMap<>();
+	private final Set<String> startPlateDimensions = new HashSet<>();
 
 	ParkourRuntime(ParkourStorage storage, ParkourScoreboard scoreboard) {
 		this.storage = storage;
@@ -73,18 +82,50 @@ final class ParkourRuntime {
 	void rebuildStartPlateIndex() {
 		// Cache start plates by dimension + block position so idle players do not scan every parkour each tick.
 		startPlateIndex.clear();
+		checkpointPlateIndexes.clear();
+		startPlateDimensions.clear();
 		storage.parkours.forEach((name, parkour) -> {
 			if (parkour.start != null) {
 				startPlateIndex.put(new PlateKey(parkour.start.dimension(), parkour.start.blockPos()), name);
+				startPlateDimensions.add(parkour.start.dimension());
 			}
+			rebuildCheckpointPlateIndex(name, parkour);
 		});
 	}
 
 	void updateStartPlateIndex(String name) {
 		startPlateIndex.entrySet().removeIf(entry -> entry.getValue().equals(name));
+		rebuildStartPlateDimensions();
 		ParkourStorage.ParkourData parkour = storage.parkours.get(name);
 		if (parkour != null && parkour.start != null) {
 			startPlateIndex.put(new PlateKey(parkour.start.dimension(), parkour.start.blockPos()), name);
+			startPlateDimensions.add(parkour.start.dimension());
+		}
+	}
+
+	void updateCheckpointPlateIndex(String name) {
+		checkpointPlateIndexes.remove(name);
+		ParkourStorage.ParkourData parkour = storage.parkours.get(name);
+		if (parkour != null) {
+			rebuildCheckpointPlateIndex(name, parkour);
+		}
+	}
+
+	private void rebuildStartPlateDimensions() {
+		startPlateDimensions.clear();
+		startPlateIndex.keySet().forEach(key -> startPlateDimensions.add(key.dimension()));
+	}
+
+	private void rebuildCheckpointPlateIndex(String name, ParkourStorage.ParkourData parkour) {
+		Map<PlateKey, Integer> checkpointIndex = new HashMap<>();
+		for (int i = 0; i < parkour.checkpoints.size(); i++) {
+			ParkourLocation checkpoint = parkour.checkpoints.get(i);
+			if (checkpoint != null) {
+				checkpointIndex.put(new PlateKey(checkpoint.dimension(), checkpoint.blockPos()), i);
+			}
+		}
+		if (!checkpointIndex.isEmpty()) {
+			checkpointPlateIndexes.put(name, checkpointIndex);
 		}
 	}
 
@@ -135,29 +176,36 @@ final class ParkourRuntime {
 
 	void handleAcceptedMovement(ServerPlayer player, double oldX, double oldY, double oldZ, long currentNanos) {
 		ServerLevel level = player.level();
-		PlayerSnapshot previousSnapshot = movementPreviousSnapshot(player, level, oldX, oldY, oldZ, currentNanos);
+		UUID playerId = player.getUUID();
+		RunState run = runs.get(playerId);
+		String dimension = level.dimension().identifier().toString();
+		if (run == null && !startPlateDimensions.contains(dimension)) {
+			return;
+		}
+
 		BlockPos currentPlate = pressurePlateAtPosition(level, player, player.getX(), player.getY(), player.getZ());
-		BlockPos previousPlate = pressurePlateAtPosition(level, player, oldX, oldY, oldZ);
+		BlockPos previousPlate = currentPlate == null ? null : pressurePlateAtPosition(level, player, oldX, oldY, oldZ);
+		PlayerSnapshot previousSnapshot = currentPlate == null ? null : movementPreviousSnapshot(player, level, oldX, oldY, oldZ, currentNanos);
 
 		if (currentPlate == null) {
-			lastStartPlates.remove(player.getUUID());
+			lastStartPlates.remove(playerId);
 		} else {
-			BlockPos lastStartPlate = lastStartPlates.get(player.getUUID());
+			BlockPos lastStartPlate = lastStartPlates.get(playerId);
 			boolean steppedOntoStartPlate = !currentPlate.equals(lastStartPlate) && !currentPlate.equals(previousPlate);
 
 			// Movement handling sees the accepted server position immediately, so start timing before the next tick.
-			if (!runs.containsKey(player.getUUID()) && steppedOntoStartPlate) {
+			if (run == null && steppedOntoStartPlate) {
 				String parkourName = startPlateIndex.get(PlateKey.of(level, currentPlate));
 				ParkourStorage.ParkourData parkour = parkourName == null ? null : storage.parkours.get(parkourName);
 				if (parkour != null && parkour.isComplete()) {
 					long startNanos = interpolatedTriggerNanos(level, player, previousSnapshot, currentPlate, player.getX(), player.getY(), player.getZ(), currentNanos);
 					startRun(player, parkourName, parkour, startNanos);
+					run = runs.get(playerId);
 				}
 			}
-			lastStartPlates.put(player.getUUID(), currentPlate);
+			lastStartPlates.put(playerId, currentPlate);
 		}
 
-		RunState run = runs.get(player.getUUID());
 		if (run != null) {
 			ParkourStorage.ParkourData parkour = storage.parkours.get(run.parkourName);
 			if (parkour != null && parkour.isComplete() && movedAwayFromSpawn(player, parkour, oldX, oldZ)) {
@@ -187,6 +235,25 @@ final class ParkourRuntime {
 		}
 		// Active runs and short post-teleport windows should never apply fall damage.
 		return !runs.containsKey(player.getUUID()) && System.currentTimeMillis() > fallDamageGraceUntil.getOrDefault(player.getUUID(), 0L);
+	}
+
+	void cleanupPlayer(ServerPlayer player) {
+		UUID playerId = player.getUUID();
+		runs.remove(playerId);
+		lastStartPlates.remove(playerId);
+		fallDamageGraceUntil.remove(playerId);
+		finishTeleports.remove(playerId);
+		playerSnapshots.remove(playerId);
+		removeCheckpointItem(player);
+		removeResetItem(player);
+		showAllHiddenPlayers(player);
+		if (previousTeams.containsKey(playerId)) {
+			restorePlayerCollision(player);
+		}
+
+		int entityId = player.getId();
+		hiddenEntityIdsByViewer.values().forEach(hiddenIds -> hiddenIds.remove(entityId));
+		hiddenReleaseTicksByViewer.values().forEach(releaseTicks -> releaseTicks.remove(entityId));
 	}
 
 	InteractionResult useResetItem(Player player, Level world, InteractionHand hand) {
@@ -491,19 +558,22 @@ final class ParkourRuntime {
 	}
 
 	private void markCheckpoint(ServerLevel level, ServerPlayer player, RunState run, ParkourStorage.ParkourData parkour, BlockPos platePos) {
-		for (int i = 0; i < parkour.checkpoints.size(); i++) {
-			ParkourLocation checkpoint = parkour.checkpoints.get(i);
-			if (run.reachedCheckpoints.contains(i) || !isSameBlock(level, platePos, checkpoint)) {
-				continue;
-			}
-
-			run.reachedCheckpoints.add(i);
-			run.lastCheckpoint = checkpoint;
-			run.highestY = player.getY();
-			run.extraFallBlocks = 0.0D;
-			playSound(player, SoundEvents.NOTE_BLOCK_PLING.value(), 0.6F, 1.8F);
+		Map<PlateKey, Integer> checkpointIndex = checkpointPlateIndexes.get(run.parkourName);
+		if (checkpointIndex == null) {
 			return;
 		}
+
+		Integer checkpointId = checkpointIndex.get(PlateKey.of(level, platePos));
+		if (checkpointId == null || run.reachedCheckpoints.contains(checkpointId) || checkpointId >= parkour.checkpoints.size()) {
+			return;
+		}
+
+		ParkourLocation checkpoint = parkour.checkpoints.get(checkpointId);
+		run.reachedCheckpoints.add(checkpointId);
+		run.lastCheckpoint = checkpoint;
+		run.highestY = player.getY();
+		run.extraFallBlocks = 0.0D;
+		playSound(player, SoundEvents.NOTE_BLOCK_PLING.value(), 0.6F, 1.8F);
 	}
 
 	private boolean hasReachedAllCheckpoints(RunState run, ParkourStorage.ParkourData parkour) {
@@ -618,35 +688,52 @@ final class ParkourRuntime {
 
 	private void updateAutoHiddenPlayers(ServerPlayer viewer) {
 		Set<Integer> hiddenEntityIds = hiddenEntityIdsByViewer.computeIfAbsent(viewer.getUUID(), ignored -> new HashSet<>());
-		Set<Integer> shouldBeHidden = new HashSet<>();
+		Map<Integer, Integer> releaseTicks = hiddenReleaseTicksByViewer.computeIfAbsent(viewer.getUUID(), ignored -> new HashMap<>());
+		double hideDistanceSqr = AUTO_HIDE_PLAYER_RADIUS * AUTO_HIDE_PLAYER_RADIUS;
+		double showDistanceSqr = AUTO_SHOW_PLAYER_RADIUS * AUTO_SHOW_PLAYER_RADIUS;
 
 		for (ServerPlayer other : viewer.level().players()) {
 			if (other.getUUID().equals(viewer.getUUID())) {
 				continue;
 			}
 
-			if (viewer.distanceToSqr(other) <= AUTO_HIDE_PLAYER_RADIUS * AUTO_HIDE_PLAYER_RADIUS) {
-				shouldBeHidden.add(other.getId());
+			if (viewer.distanceToSqr(other) <= hideDistanceSqr) {
+				releaseTicks.remove(other.getId());
 				if (hiddenEntityIds.add(other.getId())) {
 					hidePlayer(viewer, other);
 				}
 			}
 		}
 
-		hiddenEntityIds.removeIf(entityId -> {
-			if (shouldBeHidden.contains(entityId)) {
-				return false;
-			}
+		Iterator<Integer> iterator = hiddenEntityIds.iterator();
+		while (iterator.hasNext()) {
+			int entityId = iterator.next();
 			ServerPlayer other = findPlayerByEntityId(viewer.level(), entityId);
-			if (other != null) {
-				showPlayer(viewer, other);
+			if (other == null) {
+				releaseTicks.remove(entityId);
+				iterator.remove();
+				continue;
 			}
-			return true;
-		});
+
+			if (viewer.distanceToSqr(other) <= showDistanceSqr) {
+				releaseTicks.remove(entityId);
+				continue;
+			}
+
+			int ticksRemaining = releaseTicks.getOrDefault(entityId, AUTO_HIDE_RELEASE_TICKS);
+			if (ticksRemaining <= 0) {
+				showPlayer(viewer, other);
+				releaseTicks.remove(entityId);
+				iterator.remove();
+			} else {
+				releaseTicks.put(entityId, ticksRemaining - 1);
+			}
+		}
 	}
 
 	private void showAllHiddenPlayers(ServerPlayer viewer) {
 		Set<Integer> hiddenEntityIds = hiddenEntityIdsByViewer.remove(viewer.getUUID());
+		hiddenReleaseTicksByViewer.remove(viewer.getUUID());
 		if (hiddenEntityIds == null) {
 			return;
 		}
@@ -669,13 +756,19 @@ final class ParkourRuntime {
 	}
 
 	private void hidePlayer(ServerPlayer viewer, ServerPlayer other) {
-		viewer.connection.send(new ClientboundRemoveEntitiesPacket(other.getId()));
+		sendViewerInvisibility(viewer, other, true);
 	}
 
 	private void showPlayer(ServerPlayer viewer, ServerPlayer other) {
-		viewer.connection.send(new ClientboundAddEntityPacket(other, 0, other.blockPosition()));
-		viewer.connection.send(new ClientboundRotateHeadPacket(other, (byte) ((int) (other.getYHeadRot() * 256.0F / 360.0F))));
-		viewer.connection.send(new ClientboundSetEntityDataPacket(other.getId(), other.getEntityData().getNonDefaultValues()));
+		sendViewerInvisibility(viewer, other, false);
+	}
+
+	private void sendViewerInvisibility(ServerPlayer viewer, ServerPlayer other, boolean invisible) {
+		byte sharedFlags = other.getEntityData().get(SHARED_FLAGS_ACCESSOR);
+		byte viewerFlags = invisible ? (byte) (sharedFlags | INVISIBLE_FLAG) : sharedFlags;
+		viewer.connection.send(new ClientboundSetEntityDataPacket(
+			other.getId(),
+			java.util.List.of(SynchedEntityData.DataValue.create(SHARED_FLAGS_ACCESSOR, viewerFlags))));
 	}
 
 	private void disablePlayerCollision(ServerPlayer player) {
@@ -721,6 +814,17 @@ final class ParkourRuntime {
 
 	private static long elapsedMillis(long startedAtNanos, long finishedAtNanos) {
 		return (finishedAtNanos - startedAtNanos) / 1_000_000L;
+	}
+
+	@SuppressWarnings("unchecked")
+	private static EntityDataAccessor<Byte> sharedFlagsAccessor() {
+		try {
+			Field field = Entity.class.getDeclaredField("DATA_SHARED_FLAGS_ID");
+			field.setAccessible(true);
+			return (EntityDataAccessor<Byte>) field.get(null);
+		} catch (ReflectiveOperationException exception) {
+			throw new IllegalStateException("Cannot access Entity shared flags data accessor", exception);
+		}
 	}
 
 	private static final class RunState {

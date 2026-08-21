@@ -6,6 +6,7 @@ import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.event.player.UseItemCallback;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -31,6 +32,7 @@ public final class ParkourMod implements ModInitializer {
 		ServerTickEvents.END_SERVER_TICK.register(server -> runtime.tick(server));
 		ServerLivingEntityEvents.ALLOW_DAMAGE.register((entity, source, amount) -> runtime.allowDamage(entity, source, amount));
 		UseItemCallback.EVENT.register((player, world, hand) -> runtime.useResetItem(player, world, hand));
+		ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> runtime.cleanupPlayer(handler.player));
 		// Suppliers keep command handlers pointing at the current runtime after SERVER_STARTED replaces these instances.
 		CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> new ParkourCommands(ParkourMod::storage, ParkourMod::runtime, ParkourMod::scoreboard).register(dispatcher));
 	}
