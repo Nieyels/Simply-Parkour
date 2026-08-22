@@ -1,7 +1,9 @@
 package com.example.parkour.mixin;
 
 import com.example.parkour.ParkourMod;
+import net.minecraft.network.protocol.game.ServerboundContainerClickPacket;
 import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
+import net.minecraft.network.protocol.game.ServerboundPlayerActionPacket;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.network.ServerGamePacketListenerImpl;
 import org.spongepowered.asm.mixin.Mixin;
@@ -35,5 +37,19 @@ public abstract class ServerGamePacketListenerImplMixin {
 	@Inject(method = "handleMovePlayer", at = @At("RETURN"))
 	private void parkourmod$afterAcceptedMovement(ServerboundMovePlayerPacket packet, CallbackInfo ci) {
 		ParkourMod.handlePlayerMovement(player, parkourmod$oldX, parkourmod$oldY, parkourmod$oldZ, System.nanoTime());
+	}
+
+	@Inject(method = "handleContainerClick", at = @At("HEAD"), cancellable = true)
+	private void parkourmod$blockProtectedParkourItemClicks(ServerboundContainerClickPacket packet, CallbackInfo ci) {
+		if (ParkourMod.shouldBlockContainerClick(player, packet)) {
+			ci.cancel();
+		}
+	}
+
+	@Inject(method = "handlePlayerAction", at = @At("HEAD"), cancellable = true)
+	private void parkourmod$blockProtectedParkourItemActions(ServerboundPlayerActionPacket packet, CallbackInfo ci) {
+		if (ParkourMod.shouldBlockPlayerAction(player, packet)) {
+			ci.cancel();
+		}
 	}
 }

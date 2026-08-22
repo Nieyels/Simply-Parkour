@@ -7,6 +7,8 @@ import net.minecraft.core.particles.ParticleTypes;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.protocol.game.ClientboundSetEntityDataPacket;
 import net.minecraft.network.protocol.game.ClientboundSoundPacket;
+import net.minecraft.network.protocol.game.ServerboundContainerClickPacket;
+import net.minecraft.network.protocol.game.ServerboundPlayerActionPacket;
 import net.minecraft.network.syncher.EntityDataAccessor;
 import net.minecraft.network.syncher.SynchedEntityData;
 import net.minecraft.server.MinecraftServer;
@@ -25,8 +27,11 @@ import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
+import net.minecraft.world.inventory.ContainerInput;
+import net.minecraft.world.inventory.Slot;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.BasePressurePlateBlock;
+import net.minecraft.world.phys.EntityHitResult;
 import net.minecraft.world.scores.PlayerTeam;
 import net.minecraft.world.scores.Team;
 
@@ -44,8 +49,8 @@ final class ParkourRuntime {
 	private static final String NO_COLLISION_TEAM_NAME = "parkour_nocoll";
 	private static final int CHECKPOINT_SLOT = 7;
 	private static final int RESET_SLOT = 8;
-	private static final double AUTO_HIDE_PLAYER_RADIUS = 3.0D;
-	private static final double AUTO_SHOW_PLAYER_RADIUS = 3.45D;
+	private static final double AUTO_HIDE_PLAYER_RADIUS = 5.0D;
+	private static final double AUTO_SHOW_PLAYER_RADIUS = 5.75D;
 	private static final double FALL_ZONE_RADIUS = 1.8D;
 	private static final double SPAWN_YAW_CHECK_RADIUS = 3.0D;
 	private static final double PRESSURE_PLATE_EDGE_SAMPLE = 0.25D;
@@ -230,11 +235,28 @@ final class ParkourRuntime {
 	}
 
 	boolean allowDamage(LivingEntity entity, DamageSource source, float amount) {
-		if (!(entity instanceof ServerPlayer player) || !source.is(DamageTypes.FALL)) {
+		if (!(entity instanceof ServerPlayer player)) {
 			return true;
 		}
+
+		if (runs.containsKey(player.getUUID()) && isEntityAttack(source)) {
+			return false;
+		}
+
+		if (!source.is(DamageTypes.FALL)) {
+			return true;
+		}
+
 		// Active runs and short post-teleport windows should never apply fall damage.
 		return !runs.containsKey(player.getUUID()) && System.currentTimeMillis() > fallDamageGraceUntil.getOrDefault(player.getUUID(), 0L);
+	}
+
+	InteractionResult attackEntity(Player player, Level world, InteractionHand hand, Entity entity, EntityHitResult hitResult) {
+		if (!(player instanceof ServerPlayer serverPlayer) || !runs.containsKey(serverPlayer.getUUID())) {
+			return InteractionResult.PASS;
+		}
+
+		return InteractionResult.FAIL;
 	}
 
 	void cleanupPlayer(ServerPlayer player) {
@@ -292,6 +314,42 @@ final class ParkourRuntime {
 		}
 		playSound(serverPlayer, SoundEvents.NOTE_BLOCK_BASS.value(), 0.8F, 0.8F);
 		return InteractionResult.SUCCESS;
+	}
+
+	boolean shouldBlockContainerClick(ServerPlayer player, ServerboundContainerClickPacket packet) {
+		if (!runs.containsKey(player.getUUID()) || packet.containerId() != player.containerMenu.containerId) {
+			return false;
+		}
+
+		boolean touchesProtectedSlot = isProtectedMenuSlot(player, packet.slotNum())
+			|| isProtectedHotbarSwap(packet)
+			|| changedSlotsTouchProtectedItem(player, packet);
+		if (!touchesProtectedSlot && !isProtectedParkourItem(player.containerMenu.getCarried())) {
+			return false;
+		}
+
+		resyncProtectedItems(player);
+		return true;
+	}
+
+	boolean shouldBlockPlayerAction(ServerPlayer player, ServerboundPlayerActionPacket packet) {
+		if (!runs.containsKey(player.getUUID())) {
+			return false;
+		}
+
+		ServerboundPlayerActionPacket.Action action = packet.getAction();
+		if (action != ServerboundPlayerActionPacket.Action.DROP_ITEM
+			&& action != ServerboundPlayerActionPacket.Action.DROP_ALL_ITEMS
+			&& action != ServerboundPlayerActionPacket.Action.SWAP_ITEM_WITH_OFFHAND) {
+			return false;
+		}
+
+		if (!isProtectedParkourItem(player.getInventory().getSelectedItem())) {
+			return false;
+		}
+
+		resyncProtectedItems(player);
+		return true;
 	}
 
 	boolean isPressurePlate(ServerLevel level, BlockPos pos) {
@@ -686,6 +744,56 @@ final class ParkourRuntime {
 		return stack.is(Items.IRON_DOOR) && CHECKPOINT_ITEM_NAME.equals(stack.getCustomName());
 	}
 
+	private boolean isEntityAttack(DamageSource source) {
+		return source.getEntity() instanceof LivingEntity || source.getDirectEntity() instanceof LivingEntity;
+	}
+
+	private boolean isProtectedParkourItem(ItemStack stack) {
+		return isResetItem(stack) || isCheckpointItem(stack);
+	}
+
+	private boolean isProtectedHotbarSlot(int slot) {
+		return slot == RESET_SLOT || slot == CHECKPOINT_SLOT;
+	}
+
+	private boolean isProtectedHotbarSwap(ServerboundContainerClickPacket packet) {
+		return packet.containerInput() == ContainerInput.SWAP && isProtectedHotbarSlot(packet.buttonNum());
+	}
+
+	private boolean changedSlotsTouchProtectedItem(ServerPlayer player, ServerboundContainerClickPacket packet) {
+		for (int slotNum : packet.changedSlots().keySet()) {
+			if (isProtectedMenuSlot(player, slotNum)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private boolean isProtectedMenuSlot(ServerPlayer player, int slotNum) {
+		if (slotNum < 0 || !player.containerMenu.isValidSlotIndex(slotNum)) {
+			return false;
+		}
+
+		Slot slot = player.containerMenu.getSlot(slotNum);
+		return slot.container == player.getInventory() && isProtectedHotbarSlot(slot.getContainerSlot());
+	}
+
+	private void resyncProtectedItems(ServerPlayer player) {
+		player.containerMenu.setCarried(ItemStack.EMPTY);
+		if (!isResetItem(player.getInventory().getItem(RESET_SLOT))) {
+			giveResetItem(player);
+		}
+
+		RunState run = runs.get(player.getUUID());
+		ParkourStorage.ParkourData parkour = run == null ? null : storage.parkours.get(run.parkourName);
+		if (parkour != null && !parkour.checkpoints.isEmpty() && !isCheckpointItem(player.getInventory().getItem(CHECKPOINT_SLOT))) {
+			giveCheckpointItem(player);
+		}
+
+		player.containerMenu.broadcastFullState();
+		player.inventoryMenu.broadcastFullState();
+	}
+
 	private void updateAutoHiddenPlayers(ServerPlayer viewer) {
 		Set<Integer> hiddenEntityIds = hiddenEntityIdsByViewer.computeIfAbsent(viewer.getUUID(), ignored -> new HashSet<>());
 		Map<Integer, Integer> releaseTicks = hiddenReleaseTicksByViewer.computeIfAbsent(viewer.getUUID(), ignored -> new HashMap<>());
@@ -779,8 +887,9 @@ final class ParkourRuntime {
 		PlayerTeam noCollisionTeam = scoreboard.getPlayerTeam(NO_COLLISION_TEAM_NAME);
 		if (noCollisionTeam == null) {
 			noCollisionTeam = scoreboard.addPlayerTeam(NO_COLLISION_TEAM_NAME);
-			noCollisionTeam.setCollisionRule(Team.CollisionRule.NEVER);
 		}
+		noCollisionTeam.setCollisionRule(Team.CollisionRule.NEVER);
+		noCollisionTeam.setSeeFriendlyInvisibles(false);
 		scoreboard.addPlayerToTeam(scoreboardName, noCollisionTeam);
 	}
 
