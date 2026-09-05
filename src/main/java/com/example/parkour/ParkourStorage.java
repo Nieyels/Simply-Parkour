@@ -56,6 +56,7 @@ final class ParkourStorage {
 		ParkourLocation finish;
 		ParkourLocation scoreboard;
 		double fallDistance = 3.0D;
+		Double finishTeleportDelaySeconds = 1.0D;
 		List<FallZone> fallZones = new ArrayList<>();
 		List<ParkourLocation> checkpoints = new ArrayList<>();
 		Map<UUID, BestTime> bestTimes = new HashMap<>();
@@ -76,6 +77,12 @@ final class ParkourStorage {
 			}
 			if (fallDistance <= 0.0D) {
 				fallDistance = 3.0D;
+			}
+			if (finishTeleportDelaySeconds == null) {
+				finishTeleportDelaySeconds = 1.0D;
+			}
+			if (finishTeleportDelaySeconds < 0.0D) {
+				finishTeleportDelaySeconds = 0.0D;
 			}
 		}
 	}

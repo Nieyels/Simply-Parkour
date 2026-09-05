@@ -18,7 +18,9 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.phys.Vec3;
 
+import java.util.Comparator;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
@@ -68,6 +70,17 @@ final class ParkourCommands {
 					context.getSource().sendSuccess(() -> message("Parkour scoreboard bijgewerkt.", ParkourText.GREEN), false);
 					return Command.SINGLE_SUCCESS;
 				}))
+			.then(Commands.literal("times")
+				.then(Commands.literal("list")
+					.then(Commands.argument("naam", StringArgumentType.word()).suggests(this::suggestParkourNames)
+						.executes(context -> listScoreboardTimes(context.getSource(), StringArgumentType.getString(context, "naam")))))
+				.then(Commands.literal("remove")
+					.then(Commands.argument("naam", StringArgumentType.word()).suggests(this::suggestParkourNames)
+						.then(Commands.argument("speler", StringArgumentType.word()).suggests(this::suggestBestTimePlayerNames)
+							.executes(context -> removeScoreboardTime(
+								context.getSource(),
+								StringArgumentType.getString(context, "naam"),
+								StringArgumentType.getString(context, "speler")))))))
 			.then(Commands.literal("config")
 				.then(Commands.argument("naam", StringArgumentType.word()).suggests(this::suggestParkourNamesAndDeleteNames)
 					.executes(context -> showConfig(context.getSource(), StringArgumentType.getString(context, "naam")))
@@ -76,6 +89,11 @@ final class ParkourCommands {
 							context.getSource(),
 							StringArgumentType.getString(context, "naam"),
 							DoubleArgumentType.getDouble(context, "blocks")))))
+					.then(Commands.literal("finishTeleport")
+						.then(Commands.argument("seconds", DoubleArgumentType.doubleArg(0.0D)).executes(context -> setFinishTeleportDelay(
+							context.getSource(),
+							StringArgumentType.getString(context, "naam"),
+							DoubleArgumentType.getDouble(context, "seconds")))))
 					.then(Commands.literal("rename")
 						.then(Commands.argument("nieuweNaam", StringArgumentType.word()).executes(context -> renameParkour(
 							context.getSource(),
@@ -130,6 +148,28 @@ final class ParkourCommands {
 
 		storage().parkours.keySet().stream()
 			.filter(name -> name.toLowerCase().startsWith(remaining))
+			.forEach(builder::suggest);
+		return builder.buildFuture();
+	}
+
+	private CompletableFuture<Suggestions> suggestBestTimePlayerNames(com.mojang.brigadier.context.CommandContext<CommandSourceStack> context, SuggestionsBuilder builder) {
+		String parkourName;
+		try {
+			parkourName = StringArgumentType.getString(context, "naam");
+		} catch (IllegalArgumentException exception) {
+			return builder.buildFuture();
+		}
+
+		ParkourStorage.ParkourData parkour = storage().parkours.get(parkourName);
+		if (parkour == null) {
+			return builder.buildFuture();
+		}
+
+		String remaining = builder.getRemainingLowerCase();
+		parkour.bestTimes.values().stream()
+			.map(best -> best.playerName)
+			.filter(name -> name != null && name.toLowerCase(Locale.ROOT).startsWith(remaining))
+			.sorted(String.CASE_INSENSITIVE_ORDER)
 			.forEach(builder::suggest);
 		return builder.buildFuture();
 	}
@@ -266,6 +306,7 @@ final class ParkourCommands {
 		source.sendSuccess(() -> editableConfigLine("Scoreboard", formatLocation(parkour.scoreboard), "/parkour set scoreboard " + name, "Zet scoreboard op je huidige positie"), false);
 		source.sendSuccess(() -> clickableConfigLine("Checkpoints", String.valueOf(parkour.checkpoints.size()), "/parkour checkpoint list " + name, "Toon alle checkpoints"), false);
 		source.sendSuccess(() -> editableConfigLine("Fall distance", formatFallDistance(parkour.fallDistance), "/parkour config " + name + " fallDistance " + formatFallDistance(parkour.fallDistance), "Pas de normale valafstand aan"), false);
+		source.sendSuccess(() -> editableConfigLine("Finish teleport", formatSeconds(parkour.finishTeleportDelaySeconds) + "s", "/parkour config " + name + " finishTeleport " + formatSeconds(parkour.finishTeleportDelaySeconds), "Aantal seconden na finish tot teleport naar spawn. 0 = nooit teleporteren"), false);
 		source.sendSuccess(() -> clickableConfigLine("Fall points", String.valueOf(parkour.fallZones.size()), "/parkour fall list " + name, "Toon alle diepe fall points"), false);
 		if (!parkour.checkpoints.isEmpty()) {
 			source.sendSuccess(() -> ParkourText.label("Checkpoints:", ParkourText.GOLD), false);
@@ -296,6 +337,20 @@ final class ParkourCommands {
 		parkour.fallDistance = blocks;
 		storage().save(source.getServer());
 		source.sendSuccess(() -> message("Parkour '" + name + "' fall distance ingesteld op " + formatFallDistance(blocks) + " blokken.", ParkourText.GREEN), false);
+		return Command.SINGLE_SUCCESS;
+	}
+
+	private int setFinishTeleportDelay(CommandSourceStack source, String name, double seconds) {
+		ParkourStorage.ParkourData parkour = storage().parkours.get(name);
+		if (parkour == null) {
+			source.sendFailure(message("Parkour '" + name + "' bestaat niet.", ParkourText.RED));
+			return 0;
+		}
+
+		parkour.finishTeleportDelaySeconds = seconds;
+		storage().save(source.getServer());
+		String value = seconds <= 0.0D ? "uit" : formatSeconds(seconds) + "s";
+		source.sendSuccess(() -> message("Parkour '" + name + "' finish teleport ingesteld op " + value + ".", ParkourText.GREEN), false);
 		return Command.SINGLE_SUCCESS;
 	}
 
@@ -416,6 +471,62 @@ final class ParkourCommands {
 		return removeFallPoint(source, name.substring(1), id);
 	}
 
+	private int listScoreboardTimes(CommandSourceStack source, String name) {
+		ParkourStorage.ParkourData parkour = storage().parkours.get(name);
+		if (parkour == null) {
+			source.sendFailure(message("Parkour '" + name + "' bestaat niet.", ParkourText.RED));
+			return 0;
+		}
+
+		source.sendSuccess(() -> ParkourText.label("--- Scoreboard tijden: ", ParkourText.GOLD)
+			.append(ParkourText.literal(name, ParkourText.GOLD))
+			.append(ParkourText.literal(" ---", ParkourText.GOLD)), false);
+		if (parkour.bestTimes.isEmpty()) {
+			source.sendSuccess(() -> message("Geen tijden opgeslagen.", ParkourText.MUTED), false);
+			return Command.SINGLE_SUCCESS;
+		}
+
+		List<Map.Entry<UUID, ParkourStorage.BestTime>> sortedTimes = sortedBestTimes(parkour);
+		for (int i = 0; i < sortedTimes.size(); i++) {
+			int rank = i + 1;
+			ParkourStorage.BestTime best = sortedTimes.get(i).getValue();
+			source.sendSuccess(() -> scoreboardTimeLine(name, rank, best), false);
+		}
+		return Command.SINGLE_SUCCESS;
+	}
+
+	private int removeScoreboardTime(CommandSourceStack source, String parkourName, String playerName) {
+		ParkourStorage.ParkourData parkour = storage().parkours.get(parkourName);
+		if (parkour == null) {
+			source.sendFailure(message("Parkour '" + parkourName + "' bestaat niet.", ParkourText.RED));
+			return 0;
+		}
+
+		UUID removedPlayerId = null;
+		ParkourStorage.BestTime removedBest = null;
+		for (Map.Entry<UUID, ParkourStorage.BestTime> entry : parkour.bestTimes.entrySet()) {
+			ParkourStorage.BestTime best = entry.getValue();
+			if (best.playerName != null && best.playerName.equalsIgnoreCase(playerName)) {
+				removedPlayerId = entry.getKey();
+				removedBest = best;
+				break;
+			}
+		}
+
+		if (removedPlayerId == null) {
+			source.sendFailure(message("Geen tijd gevonden voor '" + playerName + "' op parkour '" + parkourName + "'.", ParkourText.RED));
+			return 0;
+		}
+
+		parkour.bestTimes.remove(removedPlayerId);
+		storage().save(source.getServer());
+		scoreboard().update(source.getServer(), parkourName);
+		scoreboard().updatePersonalLines(source.getServer(), parkourName);
+		ParkourStorage.BestTime finalRemovedBest = removedBest;
+		source.sendSuccess(() -> message("Tijd verwijderd: " + finalRemovedBest.playerName + " - " + ParkourText.formatTime(finalRemovedBest.millis), ParkourText.GREEN), false);
+		return Command.SINGLE_SUCCESS;
+	}
+
 	private int listCheckpoints(CommandSourceStack source, String name) {
 		ParkourStorage.ParkourData parkour = storage().parkours.get(name);
 		if (parkour == null) {
@@ -487,6 +598,13 @@ final class ParkourCommands {
 			.append(ParkourText.literal(" #" + id + " " + formatLocation(checkpoint), ParkourText.MUTED));
 	}
 
+	private MutableComponent scoreboardTimeLine(String parkourName, int rank, ParkourStorage.BestTime best) {
+		return deletePrefix("/parkour times remove " + parkourName + " " + best.playerName, "Verwijder de tijd van " + best.playerName)
+			.append(ParkourText.literal(" #" + rank + " ", ParkourText.GOLD))
+			.append(ParkourText.raw(best.playerName, ParkourText.TEXT))
+			.append(ParkourText.literal(" - " + ParkourText.formatTime(best.millis), ParkourText.MUTED));
+	}
+
 	private MutableComponent deletePrefix(String command, String hover) {
 		return clickable("-", command, ParkourText.RED, hover);
 	}
@@ -528,6 +646,17 @@ final class ParkourCommands {
 
 	private String formatFallDistance(double value) {
 		return String.format(Locale.ROOT, "%.1f", value);
+	}
+
+	private String formatSeconds(Double value) {
+		double seconds = value == null ? 1.0D : value;
+		return String.format(Locale.ROOT, "%.1f", seconds);
+	}
+
+	private List<Map.Entry<UUID, ParkourStorage.BestTime>> sortedBestTimes(ParkourStorage.ParkourData parkour) {
+		return parkour.bestTimes.entrySet().stream()
+			.sorted(Comparator.comparingLong(entry -> entry.getValue().millis))
+			.toList();
 	}
 
 	private ParkourStorage storage() {

@@ -47,22 +47,21 @@ import java.util.UUID;
 
 final class ParkourRuntime {
 	private static final String NO_COLLISION_TEAM_NAME = "parkour_nocoll";
-	private static final int CHECKPOINT_SLOT = 7;
+	private static final int CHECKPOINT_SLOT = 6;
+	private static final int VISIBILITY_SLOT = 7;
 	private static final int RESET_SLOT = 8;
-	private static final double AUTO_HIDE_PLAYER_RADIUS = 5.0D;
-	private static final double AUTO_SHOW_PLAYER_RADIUS = 5.75D;
 	private static final double FALL_ZONE_RADIUS = 1.8D;
 	private static final double SPAWN_YAW_CHECK_RADIUS = 3.0D;
 	private static final double PRESSURE_PLATE_EDGE_SAMPLE = 0.25D;
 	private static final double PRESSURE_PLATE_MAX_CENTER_DISTANCE = 0.86D;
 	private static final double PRESSURE_PLATE_TOUCH_HEIGHT = 0.25D;
 	private static final long FALL_DAMAGE_GRACE_MILLIS = 1000L;
-	private static final int FINISH_TELEPORT_DELAY_TICKS = 20;
-	private static final int AUTO_HIDE_RELEASE_TICKS = 8;
 	private static final byte INVISIBLE_FLAG = 0x20;
 	private static final EntityDataAccessor<Byte> SHARED_FLAGS_ACCESSOR = sharedFlagsAccessor();
 	private static final Component RESET_ITEM_NAME = ParkourText.label("Reset", ParkourText.RED);
 	private static final Component CHECKPOINT_ITEM_NAME = ParkourText.label("Checkpoint", ParkourText.ORANGE);
+	private static final Component HIDE_PLAYERS_ITEM_NAME = ParkourText.label("Hide Players", ParkourText.CYAN);
+	private static final Component SHOW_PLAYERS_ITEM_NAME = ParkourText.label("Show Players", ParkourText.GREEN);
 
 	private final ParkourStorage storage;
 	private final ParkourScoreboard scoreboard;
@@ -70,8 +69,9 @@ final class ParkourRuntime {
 	private final Map<UUID, BlockPos> lastStartPlates = new HashMap<>();
 	private final Map<UUID, Long> fallDamageGraceUntil = new HashMap<>();
 	private final Map<UUID, PendingTeleport> finishTeleports = new HashMap<>();
+	private final Map<UUID, PendingFinishFeedback> finishFeedbacks = new HashMap<>();
 	private final Map<UUID, Set<Integer>> hiddenEntityIdsByViewer = new HashMap<>();
-	private final Map<UUID, Map<Integer, Integer>> hiddenReleaseTicksByViewer = new HashMap<>();
+	private final Set<UUID> playersHiddenViewers = new HashSet<>();
 	private final Map<UUID, String> previousTeams = new HashMap<>();
 	private final Map<UUID, PlayerSnapshot> playerSnapshots = new HashMap<>();
 	private final Map<PlateKey, String> startPlateIndex = new HashMap<>();
@@ -136,6 +136,7 @@ final class ParkourRuntime {
 
 	void tick(MinecraftServer server) {
 		tickFinishTeleports(server);
+		tickFinishFeedbacks(server);
 
 		for (ServerPlayer player : server.getPlayerList().getPlayers()) {
 			long currentNanos = System.nanoTime();
@@ -152,7 +153,9 @@ final class ParkourRuntime {
 			}
 
 			player.sendOverlayMessage(ParkourText.timerActionBar(elapsedMillis(run.startedAtNanos, currentNanos)));
-			updateAutoHiddenPlayers(player);
+			if (playersHiddenViewers.contains(player.getUUID())) {
+				updateHiddenPlayers(player);
+			}
 			updateFallAllowance(player, run, parkour);
 
 			if (player.getY() > run.highestY) {
@@ -265,8 +268,10 @@ final class ParkourRuntime {
 		lastStartPlates.remove(playerId);
 		fallDamageGraceUntil.remove(playerId);
 		finishTeleports.remove(playerId);
+		finishFeedbacks.remove(playerId);
 		playerSnapshots.remove(playerId);
 		removeCheckpointItem(player);
+		removeVisibilityItem(player);
 		removeResetItem(player);
 		showAllHiddenPlayers(player);
 		if (previousTeams.containsKey(playerId)) {
@@ -275,7 +280,7 @@ final class ParkourRuntime {
 
 		int entityId = player.getId();
 		hiddenEntityIdsByViewer.values().forEach(hiddenIds -> hiddenIds.remove(entityId));
-		hiddenReleaseTicksByViewer.values().forEach(releaseTicks -> releaseTicks.remove(entityId));
+		playersHiddenViewers.remove(playerId);
 	}
 
 	InteractionResult useResetItem(Player player, Level world, InteractionHand hand) {
@@ -286,7 +291,8 @@ final class ParkourRuntime {
 		ItemStack usedItem = player.getItemInHand(hand);
 		boolean resetItem = isResetItem(usedItem);
 		boolean checkpointItem = isCheckpointItem(usedItem);
-		if (!resetItem && !checkpointItem) {
+		boolean visibilityItem = isVisibilityItem(usedItem);
+		if (!resetItem && !checkpointItem && !visibilityItem) {
 			return InteractionResult.PASS;
 		}
 
@@ -300,7 +306,10 @@ final class ParkourRuntime {
 			return InteractionResult.PASS;
 		}
 
-		if (resetItem) {
+		if (visibilityItem) {
+			togglePlayerVisibility(serverPlayer);
+			return InteractionResult.SUCCESS;
+		} else if (resetItem) {
 			cancelRun(serverPlayer, false);
 			teleportToSpawn(serverPlayer.level().getServer(), serverPlayer, parkour);
 		} else {
@@ -322,7 +331,7 @@ final class ParkourRuntime {
 		}
 
 		boolean touchesProtectedSlot = isProtectedMenuSlot(player, packet.slotNum())
-			|| isProtectedHotbarSwap(packet)
+			|| isProtectedHotbarSwap(player, packet)
 			|| changedSlotsTouchProtectedItem(player, packet);
 		if (!touchesProtectedSlot && !isProtectedParkourItem(player.containerMenu.getCarried())) {
 			return false;
@@ -465,11 +474,13 @@ final class ParkourRuntime {
 	}
 
 	private void startRun(ServerPlayer player, String parkourName, ParkourStorage.ParkourData parkour, long startedAtNanos) {
+		finishFeedbacks.remove(player.getUUID());
 		runs.put(player.getUUID(), new RunState(parkourName, startedAtNanos, player.getY(), parkour.spawn));
 		disablePlayerCollision(player);
 		if (!parkour.checkpoints.isEmpty()) {
 			giveCheckpointItem(player);
 		}
+		giveVisibilityItem(player, false);
 		giveResetItem(player);
 		playSound(player, SoundEvents.NOTE_BLOCK_PLING.value(), 0.8F, 1.35F);
 	}
@@ -478,10 +489,14 @@ final class ParkourRuntime {
 		runs.remove(player.getUUID());
 		restorePlayerCollision(player);
 		removeCheckpointItem(player);
+		removeVisibilityItem(player);
 		removeResetItem(player);
 		showAllHiddenPlayers(player);
 		addFallDamageGrace(player);
-		finishTeleports.put(player.getUUID(), new PendingTeleport(run.parkourName, FINISH_TELEPORT_DELAY_TICKS));
+		int finishTeleportDelayTicks = finishTeleportDelayTicks(parkour);
+		if (finishTeleportDelayTicks > 0) {
+			finishTeleports.put(player.getUUID(), new PendingTeleport(run.parkourName, finishTeleportDelayTicks));
+		}
 		long millis = elapsedMillis(run.startedAtNanos, finishedAtNanos);
 		ParkourStorage.BestTime personalBest = parkour.bestTimes.get(player.getUUID());
 		ParkourStorage.BestTime globalBest = parkour.bestTimes.values().stream()
@@ -505,12 +520,15 @@ final class ParkourRuntime {
 			playSound(player, SoundEvents.NOTE_BLOCK_PLING.value(), 0.8F, 1.6F);
 		}
 
+		Component finishFeedback = ParkourText.finishActionBar(millis, displayedPersonalBestMillis, displayedWorldRecordMillis);
+		finishFeedbacks.put(player.getUUID(), new PendingFinishFeedback(finishFeedback, 100));
+
 		if (newGlobalRecord) {
 			spawnWorldRecordFirework(server, parkour);
-			player.sendOverlayMessage(ParkourText.finishActionBar(millis, displayedPersonalBestMillis, displayedWorldRecordMillis));
+			player.sendOverlayMessage(finishFeedback);
 			server.getPlayerList().broadcastSystemMessage(ParkourText.recordBroadcast(player.getGameProfile().name(), run.parkourName, millis), false);
 		} else {
-			player.sendOverlayMessage(ParkourText.finishActionBar(millis, displayedPersonalBestMillis, displayedWorldRecordMillis));
+			player.sendOverlayMessage(finishFeedback);
 		}
 	}
 
@@ -576,6 +594,28 @@ final class ParkourRuntime {
 			}
 			return true;
 		});
+	}
+
+	private void tickFinishFeedbacks(MinecraftServer server) {
+		finishFeedbacks.entrySet().removeIf(entry -> {
+			PendingFinishFeedback feedback = entry.getValue();
+			ServerPlayer player = server.getPlayerList().getPlayer(entry.getKey());
+			if (player == null || feedback.ticksRemaining <= 0) {
+				return true;
+			}
+
+			player.sendOverlayMessage(feedback.message);
+			feedback.ticksRemaining--;
+			return false;
+		});
+	}
+
+	private int finishTeleportDelayTicks(ParkourStorage.ParkourData parkour) {
+		double seconds = parkour.finishTeleportDelaySeconds == null ? 1.0D : parkour.finishTeleportDelaySeconds;
+		if (seconds <= 0.0D) {
+			return 0;
+		}
+		return Math.max(1, (int) Math.round(seconds * 20.0D));
 	}
 
 	private boolean isNearSpawn(ServerPlayer player, ParkourStorage.ParkourData parkour) {
@@ -686,6 +726,7 @@ final class ParkourRuntime {
 		runs.remove(player.getUUID());
 		restorePlayerCollision(player);
 		removeCheckpointItem(player);
+		removeVisibilityItem(player);
 		removeResetItem(player);
 		showAllHiddenPlayers(player);
 		addFallDamageGrace(player);
@@ -724,6 +765,12 @@ final class ParkourRuntime {
 		player.getInventory().setItem(CHECKPOINT_SLOT, checkpointItem);
 	}
 
+	private void giveVisibilityItem(ServerPlayer player, boolean playersHidden) {
+		ItemStack visibilityItem = new ItemStack(playersHidden ? Items.ENDER_PEARL : Items.ENDER_EYE);
+		visibilityItem.set(DataComponents.CUSTOM_NAME, playersHidden ? SHOW_PLAYERS_ITEM_NAME : HIDE_PLAYERS_ITEM_NAME);
+		player.getInventory().setItem(VISIBILITY_SLOT, visibilityItem);
+	}
+
 	private void removeResetItem(ServerPlayer player) {
 		if (isResetItem(player.getInventory().getItem(RESET_SLOT))) {
 			player.getInventory().setItem(RESET_SLOT, ItemStack.EMPTY);
@@ -736,6 +783,12 @@ final class ParkourRuntime {
 		}
 	}
 
+	private void removeVisibilityItem(ServerPlayer player) {
+		if (isVisibilityItem(player.getInventory().getItem(VISIBILITY_SLOT))) {
+			player.getInventory().setItem(VISIBILITY_SLOT, ItemStack.EMPTY);
+		}
+	}
+
 	private boolean isResetItem(ItemStack stack) {
 		return stack.is(Items.BARRIER) && RESET_ITEM_NAME.equals(stack.getCustomName());
 	}
@@ -744,20 +797,21 @@ final class ParkourRuntime {
 		return stack.is(Items.IRON_DOOR) && CHECKPOINT_ITEM_NAME.equals(stack.getCustomName());
 	}
 
+	private boolean isVisibilityItem(ItemStack stack) {
+		return (stack.is(Items.ENDER_EYE) && HIDE_PLAYERS_ITEM_NAME.equals(stack.getCustomName()))
+			|| (stack.is(Items.ENDER_PEARL) && SHOW_PLAYERS_ITEM_NAME.equals(stack.getCustomName()));
+	}
+
 	private boolean isEntityAttack(DamageSource source) {
 		return source.getEntity() instanceof LivingEntity || source.getDirectEntity() instanceof LivingEntity;
 	}
 
 	private boolean isProtectedParkourItem(ItemStack stack) {
-		return isResetItem(stack) || isCheckpointItem(stack);
+		return isResetItem(stack) || isCheckpointItem(stack) || isVisibilityItem(stack);
 	}
 
-	private boolean isProtectedHotbarSlot(int slot) {
-		return slot == RESET_SLOT || slot == CHECKPOINT_SLOT;
-	}
-
-	private boolean isProtectedHotbarSwap(ServerboundContainerClickPacket packet) {
-		return packet.containerInput() == ContainerInput.SWAP && isProtectedHotbarSlot(packet.buttonNum());
+	private boolean isProtectedHotbarSwap(ServerPlayer player, ServerboundContainerClickPacket packet) {
+		return packet.containerInput() == ContainerInput.SWAP && isProtectedInventoryItemAtSlot(player, packet.buttonNum());
 	}
 
 	private boolean changedSlotsTouchProtectedItem(ServerPlayer player, ServerboundContainerClickPacket packet) {
@@ -775,7 +829,17 @@ final class ParkourRuntime {
 		}
 
 		Slot slot = player.containerMenu.getSlot(slotNum);
-		return slot.container == player.getInventory() && isProtectedHotbarSlot(slot.getContainerSlot());
+		return slot.container == player.getInventory() && isProtectedInventoryItemAtSlot(player, slot.getContainerSlot());
+	}
+
+	private boolean isProtectedInventoryItemAtSlot(ServerPlayer player, int inventorySlot) {
+		ItemStack stack = player.getInventory().getItem(inventorySlot);
+		return switch (inventorySlot) {
+			case RESET_SLOT -> isResetItem(stack);
+			case VISIBILITY_SLOT -> isVisibilityItem(stack);
+			case CHECKPOINT_SLOT -> isCheckpointItem(stack);
+			default -> false;
+		};
 	}
 
 	private void resyncProtectedItems(ServerPlayer player) {
@@ -786,31 +850,40 @@ final class ParkourRuntime {
 
 		RunState run = runs.get(player.getUUID());
 		ParkourStorage.ParkourData parkour = run == null ? null : storage.parkours.get(run.parkourName);
+		boolean playersHidden = playersHiddenViewers.contains(player.getUUID());
+		if (!isVisibilityItem(player.getInventory().getItem(VISIBILITY_SLOT))) {
+			giveVisibilityItem(player, playersHidden);
+		}
 		if (parkour != null && !parkour.checkpoints.isEmpty() && !isCheckpointItem(player.getInventory().getItem(CHECKPOINT_SLOT))) {
 			giveCheckpointItem(player);
 		}
 
-		player.containerMenu.broadcastFullState();
-		player.inventoryMenu.broadcastFullState();
+		playerInventoryRefresh(player);
 	}
 
-	private void updateAutoHiddenPlayers(ServerPlayer viewer) {
+	private void togglePlayerVisibility(ServerPlayer viewer) {
+		UUID viewerId = viewer.getUUID();
+		if (playersHiddenViewers.remove(viewerId)) {
+			showAllHiddenPlayers(viewer);
+			giveVisibilityItem(viewer, false);
+		} else {
+			playersHiddenViewers.add(viewerId);
+			updateHiddenPlayers(viewer);
+			giveVisibilityItem(viewer, true);
+		}
+		playerInventoryRefresh(viewer);
+	}
+
+	private void updateHiddenPlayers(ServerPlayer viewer) {
 		Set<Integer> hiddenEntityIds = hiddenEntityIdsByViewer.computeIfAbsent(viewer.getUUID(), ignored -> new HashSet<>());
-		Map<Integer, Integer> releaseTicks = hiddenReleaseTicksByViewer.computeIfAbsent(viewer.getUUID(), ignored -> new HashMap<>());
-		double hideDistanceSqr = AUTO_HIDE_PLAYER_RADIUS * AUTO_HIDE_PLAYER_RADIUS;
-		double showDistanceSqr = AUTO_SHOW_PLAYER_RADIUS * AUTO_SHOW_PLAYER_RADIUS;
 
 		for (ServerPlayer other : viewer.level().players()) {
 			if (other.getUUID().equals(viewer.getUUID())) {
 				continue;
 			}
 
-			if (viewer.distanceToSqr(other) <= hideDistanceSqr) {
-				releaseTicks.remove(other.getId());
-				if (hiddenEntityIds.add(other.getId())) {
-					hidePlayer(viewer, other);
-				}
-			}
+			hiddenEntityIds.add(other.getId());
+			hidePlayer(viewer, other);
 		}
 
 		Iterator<Integer> iterator = hiddenEntityIds.iterator();
@@ -818,30 +891,14 @@ final class ParkourRuntime {
 			int entityId = iterator.next();
 			ServerPlayer other = findPlayerByEntityId(viewer.level(), entityId);
 			if (other == null) {
-				releaseTicks.remove(entityId);
 				iterator.remove();
-				continue;
-			}
-
-			if (viewer.distanceToSqr(other) <= showDistanceSqr) {
-				releaseTicks.remove(entityId);
-				continue;
-			}
-
-			int ticksRemaining = releaseTicks.getOrDefault(entityId, AUTO_HIDE_RELEASE_TICKS);
-			if (ticksRemaining <= 0) {
-				showPlayer(viewer, other);
-				releaseTicks.remove(entityId);
-				iterator.remove();
-			} else {
-				releaseTicks.put(entityId, ticksRemaining - 1);
 			}
 		}
 	}
 
 	private void showAllHiddenPlayers(ServerPlayer viewer) {
+		playersHiddenViewers.remove(viewer.getUUID());
 		Set<Integer> hiddenEntityIds = hiddenEntityIdsByViewer.remove(viewer.getUUID());
-		hiddenReleaseTicksByViewer.remove(viewer.getUUID());
 		if (hiddenEntityIds == null) {
 			return;
 		}
@@ -869,6 +926,11 @@ final class ParkourRuntime {
 
 	private void showPlayer(ServerPlayer viewer, ServerPlayer other) {
 		sendViewerInvisibility(viewer, other, false);
+	}
+
+	private void playerInventoryRefresh(ServerPlayer player) {
+		player.containerMenu.broadcastFullState();
+		player.inventoryMenu.broadcastFullState();
 	}
 
 	private void sendViewerInvisibility(ServerPlayer viewer, ServerPlayer other, boolean invisible) {
@@ -958,6 +1020,16 @@ final class ParkourRuntime {
 
 		PendingTeleport(String parkourName, int ticksRemaining) {
 			this.parkourName = parkourName;
+			this.ticksRemaining = ticksRemaining;
+		}
+	}
+
+	private static final class PendingFinishFeedback {
+		final Component message;
+		int ticksRemaining;
+
+		PendingFinishFeedback(Component message, int ticksRemaining) {
+			this.message = message;
 			this.ticksRemaining = ticksRemaining;
 		}
 	}
