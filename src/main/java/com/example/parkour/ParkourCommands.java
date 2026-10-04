@@ -74,8 +74,11 @@ final class ParkourCommands {
 				.then(Commands.literal("list")
 					.then(Commands.argument("naam", StringArgumentType.word()).suggests(this::suggestParkourNames)
 						.executes(context -> listScoreboardTimes(context.getSource(), StringArgumentType.getString(context, "naam")))))
-				.then(Commands.literal("remove")
+				.then(Commands.literal("clear")
 					.then(Commands.argument("naam", StringArgumentType.word()).suggests(this::suggestParkourNames)
+						.executes(context -> clearScoreboardTimes(
+							context.getSource(),
+							StringArgumentType.getString(context, "naam")))
 						.then(Commands.argument("speler", StringArgumentType.word()).suggests(this::suggestBestTimePlayerNames)
 							.executes(context -> removeScoreboardTime(
 								context.getSource(),
@@ -527,6 +530,27 @@ final class ParkourCommands {
 		return Command.SINGLE_SUCCESS;
 	}
 
+	private int clearScoreboardTimes(CommandSourceStack source, String parkourName) {
+		ParkourStorage.ParkourData parkour = storage().parkours.get(parkourName);
+		if (parkour == null) {
+			source.sendFailure(message("Parkour '" + parkourName + "' bestaat niet.", ParkourText.RED));
+			return 0;
+		}
+
+		int removedCount = parkour.bestTimes.size();
+		if (removedCount == 0) {
+			source.sendSuccess(() -> message("Parkour '" + parkourName + "' heeft geen opgeslagen tijden.", ParkourText.MUTED), false);
+			return Command.SINGLE_SUCCESS;
+		}
+
+		parkour.bestTimes.clear();
+		storage().save(source.getServer());
+		scoreboard().update(source.getServer(), parkourName);
+		scoreboard().updatePersonalLines(source.getServer(), parkourName);
+		source.sendSuccess(() -> message(removedCount + " tijden verwijderd van parkour '" + parkourName + "'.", ParkourText.GREEN), false);
+		return Command.SINGLE_SUCCESS;
+	}
+
 	private int listCheckpoints(CommandSourceStack source, String name) {
 		ParkourStorage.ParkourData parkour = storage().parkours.get(name);
 		if (parkour == null) {
@@ -599,7 +623,7 @@ final class ParkourCommands {
 	}
 
 	private MutableComponent scoreboardTimeLine(String parkourName, int rank, ParkourStorage.BestTime best) {
-		return deletePrefix("/parkour times remove " + parkourName + " " + best.playerName, "Verwijder de tijd van " + best.playerName)
+		return deletePrefix("/parkour times clear " + parkourName + " " + best.playerName, "Verwijder de tijd van " + best.playerName)
 			.append(ParkourText.literal(" #" + rank + " ", ParkourText.GOLD))
 			.append(ParkourText.raw(best.playerName, ParkourText.TEXT))
 			.append(ParkourText.literal(" - " + ParkourText.formatTime(best.millis), ParkourText.MUTED));

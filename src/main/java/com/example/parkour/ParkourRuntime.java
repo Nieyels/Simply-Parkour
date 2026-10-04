@@ -29,6 +29,7 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.inventory.ContainerInput;
 import net.minecraft.world.inventory.Slot;
+import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.BasePressurePlateBlock;
 import net.minecraft.world.phys.EntityHitResult;
@@ -50,7 +51,7 @@ final class ParkourRuntime {
 	private static final int CHECKPOINT_SLOT = 6;
 	private static final int VISIBILITY_SLOT = 7;
 	private static final int RESET_SLOT = 8;
-	private static final double FALL_ZONE_RADIUS = 1.8D;
+	private static final double FALL_ZONE_RADIUS = 2.5D;
 	private static final double SPAWN_YAW_CHECK_RADIUS = 3.0D;
 	private static final double PRESSURE_PLATE_EDGE_SAMPLE = 0.25D;
 	private static final double PRESSURE_PLATE_MAX_CENTER_DISTANCE = 0.86D;
@@ -73,6 +74,7 @@ final class ParkourRuntime {
 	private final Map<UUID, Set<Integer>> hiddenEntityIdsByViewer = new HashMap<>();
 	private final Set<UUID> playersHiddenViewers = new HashSet<>();
 	private final Map<UUID, String> previousTeams = new HashMap<>();
+	private final Map<UUID, GameType> previousGameModes = new HashMap<>();
 	private final Map<UUID, PlayerSnapshot> playerSnapshots = new HashMap<>();
 	private final Map<PlateKey, String> startPlateIndex = new HashMap<>();
 	private final Map<String, Map<PlateKey, Integer>> checkpointPlateIndexes = new HashMap<>();
@@ -148,7 +150,7 @@ final class ParkourRuntime {
 
 			ParkourStorage.ParkourData parkour = storage.parkours.get(run.parkourName);
 			if (parkour == null || !parkour.isComplete()) {
-				runs.remove(player.getUUID());
+				cancelRun(player);
 				continue;
 			}
 
@@ -274,6 +276,7 @@ final class ParkourRuntime {
 		removeVisibilityItem(player);
 		removeResetItem(player);
 		showAllHiddenPlayers(player);
+		restoreGameMode(player);
 		if (previousTeams.containsKey(playerId)) {
 			restorePlayerCollision(player);
 		}
@@ -476,6 +479,7 @@ final class ParkourRuntime {
 	private void startRun(ServerPlayer player, String parkourName, ParkourStorage.ParkourData parkour, long startedAtNanos) {
 		finishFeedbacks.remove(player.getUUID());
 		runs.put(player.getUUID(), new RunState(parkourName, startedAtNanos, player.getY(), parkour.spawn));
+		applyAdventureMode(player);
 		disablePlayerCollision(player);
 		if (!parkour.checkpoints.isEmpty()) {
 			giveCheckpointItem(player);
@@ -488,6 +492,7 @@ final class ParkourRuntime {
 	private void finishRun(MinecraftServer server, ServerPlayer player, RunState run, ParkourStorage.ParkourData parkour, long finishedAtNanos) {
 		runs.remove(player.getUUID());
 		restorePlayerCollision(player);
+		restoreGameMode(player);
 		removeCheckpointItem(player);
 		removeVisibilityItem(player);
 		removeResetItem(player);
@@ -725,6 +730,7 @@ final class ParkourRuntime {
 	private void cancelRun(ServerPlayer player, boolean playCancelSound) {
 		runs.remove(player.getUUID());
 		restorePlayerCollision(player);
+		restoreGameMode(player);
 		removeCheckpointItem(player);
 		removeVisibilityItem(player);
 		removeResetItem(player);
@@ -966,6 +972,20 @@ final class ParkourRuntime {
 			if (previousTeam != null) {
 				scoreboard.addPlayerToTeam(scoreboardName, previousTeam);
 			}
+		}
+	}
+
+	private void applyAdventureMode(ServerPlayer player) {
+		previousGameModes.putIfAbsent(player.getUUID(), player.gameMode());
+		if (player.gameMode() != GameType.ADVENTURE) {
+			player.setGameMode(GameType.ADVENTURE);
+		}
+	}
+
+	private void restoreGameMode(ServerPlayer player) {
+		GameType previousGameMode = previousGameModes.remove(player.getUUID());
+		if (previousGameMode != null && player.gameMode() != previousGameMode) {
+			player.setGameMode(previousGameMode);
 		}
 	}
 

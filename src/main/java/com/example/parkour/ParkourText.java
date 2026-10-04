@@ -54,13 +54,10 @@ final class ParkourText {
 	}
 
 	static MutableComponent recordBroadcast(String playerName, String parkourName, long millis) {
-		return label("Nieuw record! ", GOLD)
-			.withStyle(ChatFormatting.BOLD)
-			.append(literal(playerName, PINK).withStyle(ChatFormatting.BOLD))
-			.append(literal(" heeft ", MUTED))
-			.append(literal(parkourName, CYAN))
-			.append(literal(" voltooid in ", MUTED))
-			.append(literal(formatTime(millis), GREEN).withStyle(ChatFormatting.BOLD));
+		return Component.literal("\uE012 ").withStyle(ChatFormatting.WHITE)
+			.append(Component.literal(smallCaps("Nieuw record! ")).withStyle(ChatFormatting.WHITE))
+			.append(literal(playerName, 0xDC4655))
+			.append(Component.literal(smallCaps(" heeft " + parkourName + " voltooid in " + formatTime(millis))).withStyle(ChatFormatting.GRAY));
 	}
 
 	static MutableComponent literal(String text, int color) {
